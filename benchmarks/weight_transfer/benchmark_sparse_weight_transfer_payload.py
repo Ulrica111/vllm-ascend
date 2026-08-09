@@ -28,10 +28,18 @@ import torch_npu  # noqa: F401  # Register NPU multiprocessing reductions.
 from torch.multiprocessing.reductions import reduce_tensor
 from vllm.utils.network_utils import get_open_port
 
-from benchmarks.weight_transfer.sparse_weight_transfer_metrics import (
-    SparseTransferMeasurementRow,
-    build_measurement_rows,
-)
+try:
+    from benchmarks.weight_transfer.sparse_weight_transfer_metrics import (
+        SparseTransferMeasurementRow,
+        build_measurement_rows,
+    )
+except ModuleNotFoundError:
+    # Direct ``python benchmarks/weight_transfer/<script>.py`` execution only
+    # adds this directory, rather than the repository root, to ``sys.path``.
+    from sparse_weight_transfer_metrics import (  # type: ignore[no-redef]
+        SparseTransferMeasurementRow,
+        build_measurement_rows,
+    )
 from vllm_ascend.distributed.weight_transfer.hccl_common import (
     stateless_init_process_group,
 )
