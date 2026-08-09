@@ -17,10 +17,12 @@ output_dir=""
 device=0
 warmup=1
 repeats=5
+max_updates_per_request=16000000
 
 usage() {
     echo "Usage: $0 --model MODEL --output-dir DIRECTORY" >&2
     echo "       [--base-url URL] [--device N] [--warmup N] [--repeats N]" >&2
+    echo "       [--max-updates-per-request N]" >&2
 }
 
 while (($#)); do
@@ -31,6 +33,7 @@ while (($#)); do
         --device) device=$2; shift 2 ;;
         --warmup) warmup=$2; shift 2 ;;
         --repeats) repeats=$2; shift 2 ;;
+        --max-updates-per-request) max_updates_per_request=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -57,6 +60,7 @@ run_ratio() {
         --ratio "$ratio" \
         --warmup "$warmup" \
         --repeats "$repeats" \
+        --max-updates-per-request "$max_updates_per_request" \
         --output "${prefix}.json" \
         2>&1 | tee "${prefix}.log"
     status=${PIPESTATUS[0]}

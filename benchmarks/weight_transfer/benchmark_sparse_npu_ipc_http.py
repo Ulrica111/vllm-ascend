@@ -83,24 +83,47 @@ def post(base_url: str, endpoint: str, payload: dict[str, object] | None = None)
     response.raise_for_status()
 
 
-def make_patch(name: str, parameter: torch.Tensor, count: int) -> SparseWeightPatch:
-    """Build a deterministic evenly-spaced patch from a runtime parameter."""
-    flat = parameter.detach().view(-1)
-    if count == flat.numel():
-        indices = torch.arange(count, device=flat.device, dtype=torch.int32)
-        values = flat
-    else:
-        stride = flat.numel() // count
-        indices = torch.arange(count, device=flat.device, dtype=torch.int32) * stride
-        values = flat.index_select(0, indices.to(dtype=torch.long)).contiguous()
-    return SparseWeightPatch(name=name, indices=indices, values=values)
-
-
-def iter_patches(
-    parameters: dict[str, torch.Tensor], plan: list[tuple[str, int]]
+def iter_patch_chunks(
+    parameters: dict[str, torch.Tensor],
+    plan: list[tuple[str, int]],
+    max_updates_per_request: int,
 ) -> Iterator[SparseWeightPatch]:
+    """Yield bounded sparse patches without materializing all indices at once."""
     for name, count in plan:
-        yield make_patch(name, parameters[name], count)
+        flat = parameters[name].detach().view(-1)
+        stride = 1 if count == flat.numel() else flat.numel() // count
+        for start in range(0, count, max_updates_per_request):
+            stop = min(start + max_updates_per_request, count)
+            indices = torch.arange(
+                start, stop, device=flat.device, dtype=torch.int32
+            )
+            if stride != 1:
+                indices.mul_(stride)
+                values = flat.index_select(
+                    0, indices.to(dtype=torch.long)
+                ).contiguous()
+            else:
+                values = flat.narrow(0, start, stop - start)
+            yield SparseWeightPatch(name=name, indices=indices, values=values)
+
+
+def iter_patch_batches(
+    parameters: dict[str, torch.Tensor],
+    plan: list[tuple[str, int]],
+    max_updates_per_request: int,
+) -> Iterator[list[SparseWeightPatch]]:
+    """Group bounded patches so one IPC request stays within its index budget."""
+    batch: list[SparseWeightPatch] = []
+    batch_updates = 0
+    for patch in iter_patch_chunks(parameters, plan, max_updates_per_request):
+        if batch and batch_updates + patch.indices.numel() > max_updates_per_request:
+            yield batch
+            batch = []
+            batch_updates = 0
+        batch.append(patch)
+        batch_updates += patch.indices.numel()
+    if batch:
+        yield batch
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -132,6 +155,7 @@ def run_update(
     parameters: dict[str, torch.Tensor],
     plan: list[tuple[str, int]],
     trainer_args: SparseNPUIPCTrainerSendWeightsArgs,
+    max_updates_per_request: int,
 ) -> dict[str, object]:
     memory_baseline = capture_memory_baseline()
     start_e2e = time.perf_counter()
@@ -145,9 +169,14 @@ def run_update(
 
     torch.npu.synchronize()
     start = time.perf_counter()
-    SparseNPUIPCWeightTransferEngine.trainer_send_weights(
-        iter_patches(parameters, plan), trainer_args
-    )
+    ipc_update_request_count = 0
+    for patches in iter_patch_batches(
+        parameters, plan, max_updates_per_request
+    ):
+        SparseNPUIPCWeightTransferEngine.trainer_send_weights(
+            iter(patches), trainer_args
+        )
+        ipc_update_request_count += 1
     torch.npu.synchronize()
     trainer_send_ms = (time.perf_counter() - start) * 1000
 
@@ -165,6 +194,7 @@ def run_update(
         "finish_ms": finish_ms,
         "resume_ms": resume_ms,
         "e2e_update_ms": (time.perf_counter() - start_e2e) * 1000,
+        "ipc_update_request_count": ipc_update_request_count,
         "memory": collect_peak_memory_stats(torch.npu, memory_baseline),
     }
 
@@ -177,6 +207,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--max-updates-per-request", type=int, default=16_000_000)
     parser.add_argument("--verify-prompt", default=DEFAULT_VERIFY_PROMPT)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -193,6 +224,8 @@ def main() -> None:
         raise RuntimeError("Sparse NPU IPC benchmark currently requires server TP=1")
     if args.warmup < 0 or args.repeats <= 0:
         raise ValueError("warmup must be non-negative and repeats must be positive")
+    if args.max_updates_per_request <= 0:
+        raise ValueError("max-updates-per-request must be positive")
 
     os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     device = f"npu:{args.device}"
@@ -222,16 +255,28 @@ def main() -> None:
     post(args.base_url, "init_weight_transfer_engine", {"init_info": {}})
     print(f"ratio={args.ratio:.3%}, elements={update_elements}, wire={wire_bytes / 2**30:.2f} GiB")
     for _ in range(args.warmup):
-        run_update(args.base_url, parameters, plan, trainer_args)
+        run_update(
+            args.base_url,
+            parameters,
+            plan,
+            trainer_args,
+            args.max_updates_per_request,
+        )
     samples = [
-        run_update(args.base_url, parameters, plan, trainer_args)
+        run_update(
+            args.base_url,
+            parameters,
+            plan,
+            trainer_args,
+            args.max_updates_per_request,
+        )
         for _ in range(args.repeats)
     ]
     completion = verify_completion(args.base_url, args.model, args.verify_prompt)
     metrics = {
         key: summarize([sample[key] for sample in samples])
         for key in samples[0]
-        if key != "memory"
+        if key not in {"memory", "ipc_update_request_count"}
     }
     memory_metrics = {
         key: summarize_bytes([sample["memory"][key] for sample in samples])
@@ -246,6 +291,10 @@ def main() -> None:
         "updated_elements": update_elements,
         "wire_bytes": wire_bytes,
         "parameter_count": len(plan),
+        "max_updates_per_request": args.max_updates_per_request,
+        "ipc_update_request_counts": [
+            sample["ipc_update_request_count"] for sample in samples
+        ],
         "warmup": args.warmup,
         "repeats": args.repeats,
         "completion_after_update": completion,
