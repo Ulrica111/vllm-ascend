@@ -41,7 +41,7 @@ def test_measurement_rows_reject_payload_incompatible_with_value_dtype() -> None
             value_bytes=2,
             index_bytes=4,
         )
-    except ValueError, as exc:
+    except ValueError as exc:
         assert "divisible" in str(exc)
     else:
         raise AssertionError("Expected a ValueError for an unaligned payload")
