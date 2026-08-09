@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
 # Run the five real-Qwen3 Sparse HCCL update ratios against an already-running
-# server configured with {"backend":"sparse_hccl"}. The script intentionally
+# server configured with {"backend":"sparse_nccl"}. The script intentionally
 # launches the Python benchmark once per ratio so every ratio has independent
 # trainer loading, five-repeat samples, JSON output, log, and exit status.
 
