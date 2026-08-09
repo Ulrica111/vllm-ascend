@@ -21,6 +21,16 @@ class SparseTransferMeasurementRow:
         """Logical payload saving relative to the complete Dense tensor."""
         return (1 - self.sparse_payload_bytes / self.dense_payload_bytes) * 100
 
+    @property
+    def dense_comparison_payload_bytes(self) -> int:
+        """Dense wire size used for the equal-payload timing baseline.
+
+        The full Dense parameter remains the savings reference. Timing instead
+        compares Sparse against a Dense BF16 buffer with the same wire size,
+        so each update rate has a meaningful transport-time baseline.
+        """
+        return self.sparse_payload_bytes
+
 
 def build_measurement_rows(
     *,

@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Measure fixed-payload Dense and Sparse HCCL/NPU-IPC data-plane updates.
 
-The benchmark uses an 8 MiB BF16 runtime parameter by default. Dense sends a
-complete tensor with zeroes outside the selected update positions; Sparse sends
-the same selected positions as paired int32 indices and BF16 values. The final
-receiver parameter is compared exactly so every row reports ``max_diff=0`` only
-when both wire formats produce the same result.
+The benchmark uses an 8 MiB BF16 runtime parameter by default. Sparse sends
+selected positions as paired int32 indices and BF16 values. Dense timing sends
+a BF16 buffer with exactly the same wire size as the Sparse payload, while the
+complete 8 MiB parameter remains the payload-saving reference. Sparse's final
+receiver parameter is compared against its complete deterministic reference so
+every row reports ``max_diff=0`` only when the sparse update is correct.
 
 This is a backend data-plane microbenchmark. Run the Qwen HTTP examples
 separately to validate the full vLLM lifecycle.
@@ -217,6 +218,12 @@ def _run_hccl_mode(
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue()
     port = get_open_port()
+    elements = (
+        row.dense_comparison_payload_bytes // VALUE_DTYPE.itemsize
+        if mode == "dense"
+        else row.dense_payload_bytes // VALUE_DTYPE.itemsize
+    )
+    update_elements = elements if mode == "dense" else row.update_elements
     workers = [
         context.Process(
             target=_hccl_worker,
@@ -225,8 +232,8 @@ def _run_hccl_mode(
                 devices[rank],
                 port,
                 mode,
-                row.dense_payload_bytes // VALUE_DTYPE.itemsize,
-                row.update_elements,
+                elements,
+                update_elements,
                 warmup,
                 repeats,
                 result_queue,
@@ -368,14 +375,19 @@ def _run_ipc_mode(
     payload_queue = context.Queue()
     ack_queue = context.Queue()
     result_queue = context.Queue()
-    elements = row.dense_payload_bytes // VALUE_DTYPE.itemsize
+    elements = (
+        row.dense_comparison_payload_bytes // VALUE_DTYPE.itemsize
+        if mode == "dense"
+        else row.dense_payload_bytes // VALUE_DTYPE.itemsize
+    )
+    update_elements = elements if mode == "dense" else row.update_elements
     source = context.Process(
         target=_ipc_source,
         args=(
             mode,
             device,
             elements,
-            row.update_elements,
+            update_elements,
             warmup,
             repeats,
             payload_queue,
@@ -388,7 +400,7 @@ def _run_ipc_mode(
         args=(
             device,
             elements,
-            row.update_elements,
+            update_elements,
             warmup,
             repeats,
             payload_queue,
@@ -457,15 +469,14 @@ def _run_row(
         kwargs = {"device": ipc_device}
     dense = run_mode(mode="dense", row=row, warmup=warmup, repeats=repeats, **kwargs)
     sparse = run_mode(mode="sparse", row=row, warmup=warmup, repeats=repeats, **kwargs)
-    if dense["digest"] != sparse["digest"]:
-        raise RuntimeError("Dense and Sparse receiver tensors have different digests")
     max_diff = max(float(dense["max_diff"]), float(sparse["max_diff"]))
     if max_diff != 0:
         raise RuntimeError(
-            f"Dense/Sparse update correctness failed: max_diff={max_diff}"
+            f"Weight update correctness failed: max_diff={max_diff}"
         )
     return {
         **asdict(row),
+        "dense_comparison_payload_bytes": row.dense_comparison_payload_bytes,
         "savings_percent": row.savings_percent,
         "dense_median_ms": _median(dense["sender_ms"]),
         "sparse_median_ms": _median(sparse["sender_ms"]),
@@ -485,7 +496,7 @@ def _format_bytes(byte_count: int) -> str:
 
 def _print_rows(rows: list[dict[str, Any]]) -> None:
     print(
-        "ratio  dense/sparse payload      saving    dense ms  sparse ms  "
+        "ratio  full/sparse payload       saving  dense-equal-wire ms  sparse ms  "
         "dense/sparse peak MiB  max_diff"
     )
     for row in rows:
@@ -494,7 +505,7 @@ def _print_rows(rows: list[dict[str, Any]]) -> None:
             f"{_format_bytes(row['dense_payload_bytes']):>9} / "
             f"{_format_bytes(row['sparse_payload_bytes']):>9}  "
             f"{row['savings_percent']:7.2f}%  "
-            f"{row['dense_median_ms']:8.3f}  {row['sparse_median_ms']:9.3f}  "
+            f"{row['dense_median_ms']:18.3f}  {row['sparse_median_ms']:9.3f}  "
             f"{row['dense_peak_memory_bytes'] / 2**20:6.3f} / "
             f"{row['sparse_peak_memory_bytes'] / 2**20:6.3f}  "
             f"{row['max_diff']:.0f}"
@@ -539,8 +550,8 @@ def main() -> None:
     result = {
         "backend": args.backend,
         "method": (
-            "fixed BF16 parameter; dense full tensor vs sparse int32 indices "
-            "+ BF16 values"
+            "fixed BF16 parameter; Dense timing uses the same wire bytes as "
+            "Sparse int32 indices + BF16 values"
         ),
         "warmup": args.warmup,
         "repeats": args.repeats,

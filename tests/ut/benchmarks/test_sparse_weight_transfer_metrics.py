@@ -30,6 +30,13 @@ def test_fixed_eight_mib_payload_has_expected_sparse_wire_sizes() -> None:
         -50.0,
         -200.0,
     ]
+    assert [row.dense_comparison_payload_bytes for row in rows] == [
+        25_164,
+        251_658,
+        2_516_580,
+        12_582_912,
+        25_165_824,
+    ]
 
 
 def test_measurement_rows_reject_payload_incompatible_with_value_dtype() -> None:
