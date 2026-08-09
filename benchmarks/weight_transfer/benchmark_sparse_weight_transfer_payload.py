@@ -86,7 +86,12 @@ def _peak_memory_delta(baseline: int) -> int:
 def _digest(tensor: torch.Tensor) -> str:
     """Return a stable digest after synchronizing device work."""
     _synchronize()
-    return hashlib.sha256(tensor.detach().cpu().numpy().tobytes()).hexdigest()
+    # NumPy has no native BF16 scalar type in this environment. Every BF16
+    # value is exactly representable as FP32, so this conversion preserves the
+    # equality check while allowing a portable host-side digest.
+    return hashlib.sha256(
+        tensor.detach().float().cpu().numpy().tobytes()
+    ).hexdigest()
 
 
 def _build_source_tensors(
